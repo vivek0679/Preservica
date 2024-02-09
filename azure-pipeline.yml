@@ -1,0 +1,379 @@
+# specific path build
+trigger:
+  branches:
+    include:
+    - main
+
+
+
+
+variables:
+  - group: azc-vargroup-dev-tf-iac-001
+  - group: azc-vargroup-qa-tf-iac-001
+  - group: azc-vargroup-prd-tf-iac-001
+
+  - name: CURRENT_PATH
+    value: $(System.DefaultWorkingDirectory)   # Directory of the Project
+  - name: TERRAFORM_VERSION
+    value: 1.7.2
+
+pool: selfhosted
+
+stages:
+  - stage: PublishBuildArtifacts
+    jobs:
+    - job: PublishBuildArtifacts
+      steps:
+            - task: CopyFiles@2
+              displayName : 'Copy files to ArtifactStagingDirectory'
+              inputs:
+                Contents: '**'
+                TargetFolder: $(Build.ArtifactStagingDirectory)
+                    
+            - task: PublishBuildArtifacts@1
+              displayName : 'Publish Artifact'
+
+  - stage: DEV_Approve
+    displayName: "Dev Release Approval"
+    dependsOn: [PublishBuildArtifacts]
+    condition: succeeded('PublishBuildArtifacts')
+    jobs:
+
+    - job: "Dev_Environment_Approval"
+      displayName: "Wait > Dev Release Approval"
+      pool: "server"
+      timeoutInMinutes: "180" # job times out in 3 Hrs
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "180" # job times out in 3 Hrs
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+  - stage: DEV
+    dependsOn: [DEV_Approve]
+    condition: succeeded('DEV_Approve')
+    jobs:
+    - job: install
+      displayName: 'Install Terraform'
+      steps:
+        - task: Bash@3
+          displayName: 'Install Terraform'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+
+              sudo apt install unzip -y
+              curl -SL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" --output terraform.zip
+              unzip "terraform.zip"
+              sudo mv terraform /usr/local/bin
+              terraform --version
+              rm terraform.zip
+    - job: plan
+      dependsOn:
+      - install
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/dev-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET:
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+      - bash: |
+                terraform plan -input=false -out=deployment.tfplan  -var-file=./tfvars/dev.tfvars
+        #condition: and(succeeded(), eq('${{ parameters.terraform_plan }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Plan Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET:
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+
+# Manual Approval Terraform - uses the following ...
+  # Will wait for changes to be approved if there are any resources
+  # which are  being destroyed
+  ######################################################################
+
+    - job: "waitForValidation"
+      displayName: "Wait > Wait for manual appoval"
+      dependsOn:
+      - plan
+      pool: "server"
+      timeoutInMinutes: "4320" # job times out in 3 days
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "1440" # task times out in 1 day
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+
+    - job: apply
+      dependsOn:
+      - waitForValidation   
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/dev-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET:
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+      - bash: |
+                terraform plan -input=false -refresh=false -var-file=./tfvars/dev.tfvars -out=deployment.tfplan && terraform apply  -input=false -auto-approve deployment.tfplan
+        #condition: and(succeeded(), eq('${{ parameters.terraform_apply }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Apply Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET:
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+########################################QA###############################################################################################################################          
+  - stage: QA_Approve
+    displayName: "QA Release Approval"
+    dependsOn: [PublishBuildArtifacts]
+    condition: succeeded('PublishBuildArtifacts')
+    jobs:
+
+    - job: "QA_Environment_Approval"
+      displayName: "Wait > QA Release Approval"
+      pool: "server"
+      timeoutInMinutes: "180" # job times out in 3 Hrs
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "180" # job times out in 3 Hrs
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+  - stage: QA
+    dependsOn: [QA_Approve]
+    condition: succeeded('QA_Approve')
+    jobs:
+
+    - job: install
+      displayName: 'Install Terraform'
+      dependsOn:
+      - InstallSSHKey
+      steps:
+        - task: Bash@3
+          displayName: 'Install Terraform'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+
+              sudo apt install unzip -y
+              curl -SL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" --output terraform.zip
+              unzip "terraform.zip"
+              sudo mv terraform /usr/local/bin
+              terraform --version
+              rm terraform.zip
+    - job: plan
+      dependsOn:
+      - install
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/qa-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+      - bash: |
+                terraform plan -input=false -out=deployment.tfplan  -var-file=./tfvars/qa.tfvars
+        #condition: and(succeeded(), eq('${{ parameters.terraform_plan }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Plan Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+
+# Manual Approval Terraform - uses the following ...
+  # Will wait for changes to be approved if there are any resources
+  # which are  being destroyed
+  ######################################################################
+
+    - job: "waitForValidation"
+      displayName: "Wait > Wait for manual appoval"
+      dependsOn:
+      - plan
+      pool: "server"
+      timeoutInMinutes: "4320" # job times out in 3 days
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "1440" # task times out in 1 day
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+
+    - job: apply
+      dependsOn:
+      - waitForValidation   
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/qa-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+      - bash: |
+                terraform plan -input=false -refresh=false -var-file=./tfvars/qa.tfvars -out=deployment.tfplan && terraform apply  -input=false -auto-approve deployment.tfplan
+        #condition: and(succeeded(), eq('${{ parameters.terraform_apply }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Apply Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+ ########################################PROD###############################################################################################################################          
+  - stage: PROD_Approve
+    displayName: "PROD Release Approval"
+    dependsOn: [PublishBuildArtifacts]
+    condition: succeeded('PublishBuildArtifacts')
+    jobs:
+
+    - job: "PROD_Environment_Approval"
+      displayName: "Wait > PROD Release Approval"
+      pool: "server"
+      timeoutInMinutes: "180" # job times out in 3 Hrs
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "180" # job times out in 3 Hrs
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+  - stage: PROD
+    dependsOn: [PROD_Approve]
+    condition: succeeded('PROD_Approve')
+    jobs:
+    - job: install
+      displayName: 'Install Terraform'
+      dependsOn:
+      - InstallSSHKey
+      steps:
+        - task: Bash@3
+          displayName: 'Install Terraform'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+
+              sudo apt install unzip -y
+              curl -SL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" --output terraform.zip
+              unzip "terraform.zip"
+              sudo mv terraform /usr/local/bin
+              terraform --version
+              rm terraform.zip
+    - job: plan
+      dependsOn:
+      - install
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/prd-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: qa
+
+      - bash: |
+                terraform plan -input=false -out=deployment.tfplan  -var-file=./tfvars/prd.tfvars
+        #condition: and(succeeded(), eq('${{ parameters.terraform_plan }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Plan Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: 
+
+
+# Manual Approval Terraform - uses the following ...
+  # Will wait for changes to be approved if there are any resources
+  # which are  being destroyed
+  ######################################################################
+
+    - job: "waitForValidation"
+      displayName: "Wait > Wait for manual appoval"
+      dependsOn:
+      - plan
+      pool: "server"
+      timeoutInMinutes: "4320" # job times out in 3 days
+      steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: "1440" # task times out in 1 day
+            inputs:
+              notifyUsers: |
+                
+              instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+
+    - job: apply
+      dependsOn:
+      - waitForValidation   
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      steps:
+      - bash: |
+          terraform init -input=false -backend=true -reconfigure  -backend-config=./backend/prd-backend.conf
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Initialize Terraform backend state
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: qa
+
+      - bash: |
+                terraform plan -input=false -refresh=false -var-file=./tfvars/prd.tfvars -out=deployment.tfplan && terraform apply  -input=false -auto-approve deployment.tfplan
+        #condition: and(succeeded(), eq('${{ parameters.terraform_apply }}', true))
+        workingDirectory: $(CURRENT_PATH)
+        displayName: Apply Terraform changes
+        env:
+          ARM_CLIENT_ID: 
+          ARM_CLIENT_SECRET: 
+          ARM_TENANT_ID: 
+          ARM_SUBSCRIPTION_ID: qa
+
+ 
